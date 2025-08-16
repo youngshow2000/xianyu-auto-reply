@@ -25,7 +25,7 @@ def _start_api_server():
 
     # 优先使用环境变量配置
     host = os.getenv('API_HOST', '0.0.0.0')  # 默认绑定所有接口
-    port = int(os.getenv('API_PORT', '8080'))  # 默认端口8080
+    port = int(os.getenv('API_PORT', '25396'))  # 默认端口8080
 
     # 如果配置文件中有特定配置，则使用配置文件
     if 'host' in api_conf:
@@ -35,11 +35,11 @@ def _start_api_server():
 
     # 兼容旧的URL配置方式
     if 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:
-        url = api_conf.get('url', 'http://0.0.0.0:8080/xianyu/reply')
+        url = api_conf.get('url', 'http://0.0.0.0:25396/xianyu/reply')
         parsed = urlparse(url)
         if parsed.hostname and parsed.hostname != 'localhost':
             host = parsed.hostname
-        port = parsed.port or 8080
+        port = parsed.port or 25396
 
     logger.info(f"启动Web服务器: http://{host}:{port}")
     uvicorn.run("reply_server:app", host=host, port=port, log_level="info")
