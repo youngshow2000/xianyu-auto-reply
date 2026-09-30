@@ -2,13 +2,14 @@
 数据库兼容层
 
 将旧框架的同步db_manager接口适配到新框架的异步数据库
-使用独立线程和事件循环来避免异步上下文冲突
+使用常驻线程池来避免异步上下文冲突
 """
 from __future__ import annotations
 
 import asyncio
 import time
-import threading
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from loguru import logger
 
@@ -31,125 +32,141 @@ from common.models.system_setting import SystemSetting
 from common.utils.time_utils import get_beijing_now, get_beijing_now_naive
 
 
-# 线程本地存储，用于缓存每个线程的数据库引擎和会话工厂
-_thread_local = threading.local()
+# ==================== 常驻线程池与共享引擎 ====================
+#
+# 历史实现每次同步 DB 调用都新建一个 threading.Thread（含新事件循环和新引擎），
+# 在长时间运行 + 高并发下会耗尽系统线程，触发 "can't start new thread"。
+# 现在改为：
+#   - 固定大小的常驻线程池（默认 32 个 worker），线程全程复用；
+#   - 模块级共享一个 async 引擎与会话工厂，由 SQLAlchemy 连接池管理连接；
+#   - 每个任务在线程内创建自己的事件循环，避免跨线程循环冲突。
+# 提交任务在队列中排队（无界队列，不阻塞调用线程），由 worker 依次消费；
+# 已关闭的线程池 submit 会抛 RuntimeError，由 _run_async 捕获。
+_COMPAT_POOL_WORKERS = 32
+_compat_executor = ThreadPoolExecutor(
+    max_workers=_COMPAT_POOL_WORKERS,
+    thread_name_prefix="db-compat",
+)
 
 
-def _get_thread_local_session_maker():
-    """获取当前线程的数据库会话工厂（懒加载）"""
-    if not hasattr(_thread_local, 'session_maker'):
+def _get_compat_session_maker():
+    """获取兼容层共享的数据库会话工厂（懒加载，模块级单例）"""
+    if not hasattr(_get_compat_session_maker, '_session_maker'):
         settings = get_settings()
         engine = create_async_engine(
             settings.async_database_url,
             echo=False,
             pool_pre_ping=settings.db_pool_pre_ping,  # 取连接前 ping，剔除失效连接（asyncmy ping 已在 session 层做兼容修补）
-            pool_size=1,   # 兼容层线程为一次性，单协程只需 1 条连接（原 3，避免连接累积）
-            max_overflow=2,  # 仅留少量溢出余量（原 5），降低单引擎最大连接数 8 -> 3
-            pool_timeout=settings.db_pool_timeout,  # 获取连接超时时间
-            pool_recycle=settings.db_pool_recycle,  # 连接回收时间，防止MySQL断开陈旧连接
+            pool_size=settings.db_pool_size,          # 常驻连接数（默认30）
+            max_overflow=settings.db_max_overflow,    # 峰值 = pool_size + max_overflow
+            pool_timeout=settings.db_pool_timeout,    # 获取连接超时时间
+            pool_recycle=settings.db_pool_recycle,    # 连接回收时间，防止MySQL断开陈旧连接
+            pool_use_lifo=settings.db_pool_use_lifo,  # LIFO 优先复用最近使用的连接
             connect_args={"connect_timeout": settings.db_connect_timeout},  # TCP 建连超时，远程库不可达时快速失败
         )
-        _thread_local.engine = engine
-        _thread_local.session_maker = async_sessionmaker(engine, expire_on_commit=False)
-    return _thread_local.session_maker
+        _get_compat_session_maker._engine = engine
+        _get_compat_session_maker._session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    return _get_compat_session_maker._session_maker
+
+
+def _shutdown_compat_executor() -> None:
+    """进程退出时关闭兼容层线程池与引擎（幂等，供 atexit 调用）"""
+    executor = _compat_executor
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    engine = getattr(_get_compat_session_maker, '_engine', None)
+    if engine is not None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # 仅在线程内未被事件循环占用时释放连接池，避免干扰运行中的循环
+            try:
+                engine.sync_engine.dispose()
+            except Exception:
+                pass
+
+
+atexit.register(_shutdown_compat_executor)
 
 
 class DBManagerCompat:
     """数据库管理器兼容层
-    
+
     提供与旧框架db_manager相同的同步接口，内部使用异步数据库操作
     """
-    
-    def __init__(self):
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-    
-    def _get_loop(self) -> asyncio.AbstractEventLoop:
-        """获取事件循环"""
-        try:
-            return asyncio.get_running_loop()
-        except RuntimeError:
-            if self._loop is None or self._loop.is_closed():
-                self._loop = asyncio.new_event_loop()
-            return self._loop
-    
+
     async def _run_async_coro(self, coro):
         """直接运行异步协程（在异步上下文中使用）"""
         return await coro
-    
+
     def _run_async(self, async_func: Callable):
         """在同步代码中运行异步操作
-        
-        使用独立线程和新事件循环来避免死锁
+
+        复用常驻线程池，避免每次调用都创建新线程（防止 "can't start new thread"）。
         async_func: 一个接受session_maker参数的异步函数
         """
         max_attempts = 3
 
         for attempt in range(1, max_attempts + 1):
-            result = [None]
-            exception = [None]
-
-            def run_in_thread():
-                try:
-                    # 创建新的事件循环
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        # 获取线程本地的会话工厂
-                        session_maker = _get_thread_local_session_maker()
-                        # 执行异步函数
-                        result[0] = new_loop.run_until_complete(async_func(session_maker))
-                    finally:
-                        # 主动释放本线程引擎的连接池：本兼容层使用一次性线程，
-                        # threading.local 缓存对新线程必然 miss（每次新建引擎），
-                        # 若不主动 dispose，连接需等 GC 才回收，高并发下易累积、打满 MySQL。
-                        try:
-                            engine = getattr(_thread_local, 'engine', None)
-                            if engine is not None:
-                                new_loop.run_until_complete(engine.dispose())
-                                # 清掉缓存，避免后续误用已释放的引擎
-                                _thread_local.engine = None
-                                if hasattr(_thread_local, 'session_maker'):
-                                    del _thread_local.session_maker
-                        except Exception:
-                            pass
-                        # 清理事件循环
-                        try:
-                            new_loop.run_until_complete(new_loop.shutdown_asyncgens())
-                        except Exception:
-                            pass
-                        new_loop.close()
-                except Exception as e:
-                    exception[0] = e
-
-            thread = threading.Thread(target=run_in_thread, daemon=True)
-            thread.start()
-            thread.join(timeout=30)
-
-            if thread.is_alive():
-                logger.error("异步操作超时")
+            try:
+                future = _compat_executor.submit(self._run_async_in_worker, async_func)
+            except RuntimeError:
+                # 线程池已关闭（如进程退出阶段），无法提交新任务
+                logger.error("兼容层线程池不可用，异步操作失败")
                 return None
-
-            if exception[0]:
+            except Exception as e:
+                # 其他提交异常，按可重试处理
                 if attempt < max_attempts:
-                    logger.warning(f"执行异步操作失败，第{attempt}次重试前等待 {attempt} 秒: {exception[0]}")
+                    logger.warning(f"提交异步操作失败，第{attempt}次重试前等待 {attempt} 秒: {e}")
                     time.sleep(attempt)
                     continue
-                logger.error(f"执行异步操作失败: {exception[0]}")
+                logger.error(f"提交异步操作失败: {e}")
                 return None
 
-            return result[0]
+            try:
+                result = future.result(timeout=30)
+            except TimeoutError:
+                logger.error("异步操作超时")
+                return None
+            except Exception as e:
+                if attempt < max_attempts:
+                    logger.warning(f"执行异步操作失败，第{attempt}次重试前等待 {attempt} 秒: {e}")
+                    time.sleep(attempt)
+                    continue
+                logger.error(f"执行异步操作失败: {e}")
+                return None
+
+            return result
 
         return None
-    
+
+    @staticmethod
+    def _run_async_in_worker(async_func: Callable):
+        """在常驻线程内执行一次异步 DB 操作（线程池 worker 调用）"""
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        try:
+            session_maker = _get_compat_session_maker()
+            return new_loop.run_until_complete(async_func(session_maker))
+        finally:
+            # 清理事件循环（引擎与会话工厂为模块级共享，不在此处 dispose）
+            try:
+                new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            new_loop.close()
+
     # ==================== 账号相关 ====================
-    
+
     async def get_account_pk_by_cookie_id(self, cookie_id: str) -> Optional[int]:
         """异步获取账号主键ID"""
         async with async_session_maker() as session:
             stmt = select(XYAccount.id).where(XYAccount.account_id == cookie_id)
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
-    
+
     def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, Any]]:
         """获取账号详情"""
         async def _query(session_maker):
@@ -159,7 +176,7 @@ class DBManagerCompat:
                 account = result.scalars().first()
                 if not account:
                     return None
-                
+
                 # 尝试获取账号昵称，若为空则从 cookie 中解析 tracknick，若仍为空则回退使用备注
                 display_name = account.display_name
                 if not display_name:
@@ -192,7 +209,7 @@ class DBManagerCompat:
                     'proxy_pass': account.proxy_pass,
                 }
         return self._run_async(_query)
-    
+
     def get_cookie_proxy_config(self, cookie_id: str) -> Dict[str, Any]:
         """获取代理配置"""
         async def _query(session_maker):
@@ -220,7 +237,7 @@ class DBManagerCompat:
             logger.warning(f"【{cookie_id}】获取代理配置失败，使用无代理默认配置")
             return {'proxy_type': 'none', 'proxy_host': '', 'proxy_port': 0, 'proxy_user': '', 'proxy_pass': ''}
         return result
-    
+
     def get_cookie_message_expire_time(self, cookie_id: str) -> int:
         """获取相同消息等待时间配置"""
         async def _query(session_maker):
@@ -236,7 +253,7 @@ class DBManagerCompat:
             logger.warning(f"【{cookie_id}】获取message_expire_time失败，使用默认值3600")
             return 3600
         return result
-    
+
     def get_cookie_pause_duration(self, cookie_id: str) -> int:
         """获取暂停时间"""
         async def _query(session_maker):
@@ -246,7 +263,7 @@ class DBManagerCompat:
                 duration = result.scalar_one_or_none()
                 return duration if duration is not None else 10
         return self._run_async(_query)
-    
+
     def get_auto_confirm(self, cookie_id: str) -> bool:
         """获取自动确认设置"""
         async def _query(session_maker):
@@ -256,7 +273,7 @@ class DBManagerCompat:
                 auto_confirm = result.scalar_one_or_none()
                 return bool(auto_confirm) if auto_confirm is not None else False
         return self._run_async(_query)
-    
+
     def get_confirm_before_send(self, cookie_id: str) -> bool:
         """获取发货成功再发卡券开关设置"""
         async def _query(session_maker):
@@ -328,14 +345,14 @@ class DBManagerCompat:
             return True
         return result
 
-    
+
     def get_user_setting_by_cookie_id(self, cookie_id: str, key: str) -> Optional[str]:
         """通过cookie_id获取对应用户的个人设置值
-        
+
         Args:
             cookie_id: 账号标识
             key: 设置键名
-            
+
         Returns:
             设置值，不存在返回None
         """
@@ -366,24 +383,24 @@ class DBManagerCompat:
                     values['cookie'] = kwargs['cookie_value']
                 elif 'value' in kwargs:
                     values['cookie'] = kwargs['value']
-                
+
                 if not values:
                     logger.warning(f"update_cookie_account_info: 没有要更新的字段，kwargs={kwargs}")
                     return False
-                    
+
                 stmt = update(XYAccount).where(XYAccount.account_id == cookie_id).values(**values)
                 result = await session.execute(stmt)
                 await session.commit()
                 return result.rowcount > 0
         return self._run_async(_update)
-    
+
     def disable_account(self, cookie_id: str, reason: str = "") -> bool:
         """禁用账号
-        
+
         Args:
             cookie_id: 账号ID
             reason: 禁用原因
-            
+
         Returns:
             是否成功
         """
@@ -398,20 +415,20 @@ class DBManagerCompat:
                 ).values(**values)
                 result = await session.execute(stmt)
                 await session.commit()
-                
+
                 if result.rowcount > 0:
                     logger.warning(f"【{cookie_id}】账号已被禁用，原因: {reason}")
                     return True
                 return False
         return self._run_async(_update)
-    
+
     def get_system_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         """获取系统设置值
-        
+
         Args:
             key: 设置键名
             default: 默认值
-            
+
         Returns:
             设置值，不存在时返回默认值
         """
@@ -422,9 +439,9 @@ class DBManagerCompat:
                 value = result.scalar_one_or_none()
                 return value if value is not None else default
         return self._run_async(_query)
-    
+
     # ==================== 商品相关 ====================
-    
+
     def get_item_info(self, cookie_id: str, item_id: str) -> Optional[Dict[str, Any]]:
         """获取商品信息"""
         async def _query(session_maker):
@@ -435,7 +452,7 @@ class DBManagerCompat:
                 account_pk = account_result.scalar_one_or_none()
                 if not account_pk:
                     return None
-                
+
                 stmt = select(XYCatalogItem).where(
                     XYCatalogItem.account_pk == account_pk,
                     XYCatalogItem.item_id == item_id
@@ -444,7 +461,7 @@ class DBManagerCompat:
                 item = result.scalars().first()
                 if not item:
                     return None
-                
+
                 # 从metadata_json中获取额外信息
                 metadata = item.metadata_json or {}
                 return {
@@ -462,15 +479,15 @@ class DBManagerCompat:
                     'multi_spec': metadata.get('is_multi_spec', False),
                 }
         return self._run_async(_query)
-    
+
     def get_item_multi_quantity_delivery_status(self, cookie_id: str, item_id: str) -> bool:
         """获取多数量发货状态"""
         info = self.get_item_info(cookie_id, item_id)
         return info.get('multi_quantity_delivery', False) if info else False
-    
+
     # ==================== 风控日志 ====================
-    
-    def add_risk_control_log(self, cookie_id: str, event_type: str, event_description: str, 
+
+    def add_risk_control_log(self, cookie_id: str, event_type: str, event_description: str,
                             processing_status: str = 'processing', **kwargs) -> Optional[int]:
         """添加风控日志"""
         async def _insert(session_maker):
@@ -479,7 +496,7 @@ class DBManagerCompat:
                 account_stmt = select(XYAccount.id, XYAccount.owner_id).where(XYAccount.account_id == cookie_id)
                 account_result = await session.execute(account_stmt)
                 account_row = account_result.first()
-                
+
                 log = XYRiskControlLog(
                     owner_id=account_row.owner_id if account_row else None,
                     account_pk=account_row.id if account_row else None,
@@ -499,7 +516,7 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"添加风控日志失败: {e}")
             return None
-    
+
     def update_risk_control_log(self, log_id: int, **kwargs) -> bool:
         """更新风控日志"""
         async def _update(session_maker):
@@ -619,12 +636,12 @@ class DBManagerCompat:
 
     def get_risk_control_logs(self, cookie_id: str = None, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """获取风控日志列表
-        
+
         Args:
             cookie_id: Cookie ID，为None时获取所有日志
             limit: 限制返回数量
             offset: 偏移量
-            
+
         Returns:
             List[Dict]: 风控日志列表
         """
@@ -660,10 +677,10 @@ class DBManagerCompat:
 
     def get_risk_control_logs_count(self, cookie_id: str = None) -> int:
         """获取风控日志总数
-        
+
         Args:
             cookie_id: Cookie ID，为None时获取所有日志数量
-            
+
         Returns:
             int: 日志总数
         """
@@ -679,9 +696,9 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"获取风控日志数量失败: {e}")
             return 0
-    
+
     # ==================== 订单相关 ====================
-    
+
     def get_order_by_id(self, order_id: str, account_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """按订单号获取订单信息，可选按闲鱼账号过滤。"""
         async def _query(session_maker):
@@ -711,7 +728,7 @@ class DBManagerCompat:
                     'delivery_content': order.delivery_content,
                 }
         return self._run_async(_query)
-    
+
     def update_order_yifan_status(self, order_id: str, **kwargs) -> bool:
         """更新订单亦凡状态"""
         async def _update(session_maker):
@@ -732,14 +749,14 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"更新订单状态失败: {e}")
             return False
-    
+
     def update_order_bargain_status(self, order_id: str, is_bargain: bool = True) -> bool:
         """更新订单小刀状态
-        
+
         Args:
             order_id: 订单号
             is_bargain: 是否小刀
-            
+
         Returns:
             bool: 是否更新成功
         """
@@ -757,9 +774,9 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"更新订单小刀状态失败: {e}")
             return False
-    
+
     # ==================== 关键词相关 ====================
-    
+
     def get_keywords(self, cookie_id: str) -> List[Dict[str, Any]]:
         """获取关键词列表"""
         async def _query(session_maker):
@@ -769,7 +786,7 @@ class DBManagerCompat:
                 account_pk = account_result.scalar_one_or_none()
                 if not account_pk:
                     return []
-                
+
                 stmt = select(XYKeywordRule).where(
                     XYKeywordRule.account_pk == account_pk,
                     XYKeywordRule.is_active == True
@@ -785,7 +802,7 @@ class DBManagerCompat:
                     'image_url': k.image_url,
                 } for k in keywords]
         return self._run_async(_query)
-    
+
     def get_keywords_with_type(self, cookie_id: str) -> List[Dict[str, Any]]:
         """获取关键词列表（包含类型信息）"""
         async def _query(session_maker):
@@ -795,7 +812,7 @@ class DBManagerCompat:
                 account_pk = account_result.scalar_one_or_none()
                 if not account_pk:
                     return []
-                
+
                 stmt = select(XYKeywordRule).where(
                     XYKeywordRule.account_pk == account_pk,
                     XYKeywordRule.is_active == True
@@ -811,7 +828,7 @@ class DBManagerCompat:
                     'image_url': k.image_url,
                 } for k in keywords]
         return self._run_async(_query)
-    
+
     def update_keyword_image_url(self, cookie_id: str, keyword: str, image_url: str) -> bool:
         """更新关键词图片URL"""
         async def _update(session_maker):
@@ -821,7 +838,7 @@ class DBManagerCompat:
                 account_pk = account_result.scalar_one_or_none()
                 if not account_pk:
                     return False
-                
+
                 stmt = update(XYKeywordRule).where(
                     XYKeywordRule.account_pk == account_pk,
                     XYKeywordRule.keyword == keyword
@@ -834,9 +851,9 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"更新关键词图片URL失败: {e}")
             return False
-    
+
     # ==================== 卡券相关 ====================
-    
+
     def update_card_image_url(self, card_id: int, image_url: str) -> bool:
         """更新卡券图片URL"""
         async def _update():
@@ -850,27 +867,27 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"更新卡券图片URL失败: {e}")
             return False
-    
+
     def update_card_image_urls(self, card_id: int, index: int, cdn_url: str) -> bool:
         """更新卡券多图片列表中指定索引的图片URL
-        
+
         Args:
             card_id: 卡券ID
             index: 图片索引（0-2）
             cdn_url: CDN图片URL
-            
+
         Returns:
             是否更新成功
         """
         import json
-        
+
         async def _update(session_maker):
             async with session_maker() as session:
                 # 先获取当前的image_urls
                 stmt = select(Card.image_urls).where(Card.id == card_id)
                 result = await session.execute(stmt)
                 current_urls = result.scalar_one_or_none()
-                
+
                 # 解析JSON
                 if current_urls:
                     try:
@@ -879,14 +896,14 @@ class DBManagerCompat:
                         urls_list = []
                 else:
                     urls_list = []
-                
+
                 # 确保列表长度足够
                 while len(urls_list) <= index:
                     urls_list.append("")
-                
+
                 # 更新指定索引的URL
                 urls_list[index] = cdn_url
-                
+
                 # 保存回数据库
                 new_urls_json = json.dumps(urls_list, ensure_ascii=False)
                 update_stmt = update(Card).where(Card.id == card_id).values(image_urls=new_urls_json)
@@ -898,14 +915,14 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"更新卡券多图片URL失败: {e}")
             return False
-    
+
     def update_confirm_receipt_image_url(self, cookie_id: str, image_url: str) -> bool:
         """更新确认收货消息的图片URL
-        
+
         Args:
             cookie_id: 账号ID
             image_url: CDN图片URL
-            
+
         Returns:
             是否更新成功
         """
@@ -922,15 +939,15 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"更新确认收货图片URL失败: {e}")
             return False
-    
+
     def update_default_reply_image_url(self, cookie_id: str, image_url: str, item_id: str = None) -> bool:
         """更新默认回复的图片URL
-        
+
         Args:
             cookie_id: 账号ID
             image_url: CDN图片URL
             item_id: 商品ID（可选，None表示账号级别）
-            
+
         Returns:
             是否更新成功
         """
@@ -954,25 +971,25 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"更新默认回复图片URL失败: {e}")
             return False
-    
+
     # ==================== 默认回复 ====================
     # 说明：默认回复的读写已统一由 backend-web 的 DefaultReplyService 处理，
     # websocket 端 auto_reply_service 直接用 ORM 查询，故此处不再保留兼容方法。
-    
+
     # ==================== 通知相关 ====================
-    
+
     def get_notification_config(self, cookie_id: str) -> Optional[Dict[str, Any]]:
         """获取通知配置
-        
+
         Args:
             cookie_id: Cookie ID
-            
+
         Returns:
             通知配置字典或None
         """
         from common.models.notification_channel import NotificationChannel
         from common.models.message_notification import MessageNotification
-        
+
         async def _query(session_maker):
             async with session_maker() as session:
                 # 获取账号的第一个启用的通知配置
@@ -986,13 +1003,13 @@ class DBManagerCompat:
                     MessageNotification.enabled == True,
                     NotificationChannel.enabled == True
                 ).limit(1)
-                
+
                 result = await session.execute(stmt)
                 row = result.first()
-                
+
                 if not row:
                     return None
-                
+
                 notification, channel = row
                 return {
                     'id': notification.id,
@@ -1002,21 +1019,21 @@ class DBManagerCompat:
                     'channel_type': channel.channel_type,
                     'channel_config': channel.config_payload
                 }
-        
+
         try:
             return self._run_async(_query)
         except Exception as e:
             logger.error(f"获取通知配置失败: {e}")
             return None
-    
+
     # ==================== 清理相关 ====================
-    
+
     def cleanup_old_data(self, days: int = 90) -> Dict[str, int]:
         """清理过期的历史数据
-        
+
         Args:
             days: 保留最近N天的数据，默认90天
-            
+
         Returns:
             清理统计信息
         """
@@ -1029,7 +1046,7 @@ class DBManagerCompat:
                 async with session_maker() as session:
                     from datetime import timedelta
                     cutoff_date = get_beijing_now_naive() - timedelta(days=days)
-                    
+
                     # 清理风控日志
                     try:
                         from sqlalchemy import delete
@@ -1040,15 +1057,15 @@ class DBManagerCompat:
                             logger.info(f"清理了 {result.rowcount} 条过期的风控日志（{days}天前）")
                     except Exception as e:
                         logger.warning(f"清理风控日志失败: {e}")
-                    
+
                     await session.commit()
                     stats['total_cleaned'] = stats['risk_control_logs']
-                    
+
             except Exception as e:
                 logger.error(f"清理旧数据失败: {e}")
-            
+
             return stats
-        
+
         try:
             return self._run_async(_cleanup) or {
                 'risk_control_logs': 0,
@@ -1060,19 +1077,19 @@ class DBManagerCompat:
                 'risk_control_logs': 0,
                 'total_cleaned': 0
             }
-    
+
     def get_account_notifications(self, cookie_id: str) -> List[Dict[str, Any]]:
         """获取账号的通知配置
-        
+
         Args:
             cookie_id: Cookie ID
-            
+
         Returns:
             通知配置列表
         """
         from common.models.notification_channel import NotificationChannel
         from common.models.message_notification import MessageNotification
-        
+
         async def _query(session_maker):
             async with session_maker() as session:
                 stmt = select(
@@ -1084,10 +1101,10 @@ class DBManagerCompat:
                     MessageNotification.account_identifier == cookie_id,
                     NotificationChannel.enabled == True
                 ).order_by(MessageNotification.id)
-                
+
                 result = await session.execute(stmt)
                 rows = result.all()
-                
+
                 notifications = []
                 for notification, channel in rows:
                     notifications.append({
@@ -1098,36 +1115,36 @@ class DBManagerCompat:
                         'channel_type': channel.channel_type,
                         'channel_config': channel.config_payload
                     })
-                
+
                 return notifications
-        
+
         try:
             return self._run_async(_query) or []
         except Exception as e:
             logger.error(f"获取账号通知配置失败: {e}")
             return []
-    
+
     def get_notification_channels(self, user_id: int = None) -> List[Dict[str, Any]]:
         """获取所有通知渠道
-        
+
         Args:
             user_id: 用户ID，为None时获取所有渠道
-            
+
         Returns:
             通知渠道列表
         """
         from common.models.notification_channel import NotificationChannel
-        
+
         async def _query(session_maker):
             async with session_maker() as session:
                 stmt = select(NotificationChannel)
                 if user_id:
                     stmt = stmt.where(NotificationChannel.owner_id == user_id)
                 stmt = stmt.where(NotificationChannel.enabled == True)
-                
+
                 result = await session.execute(stmt)
                 channels = result.scalars().all()
-                
+
                 return [{
                     'id': ch.id,
                     'name': ch.name,
@@ -1135,22 +1152,22 @@ class DBManagerCompat:
                     'config': ch.config_payload,
                     'enabled': ch.enabled
                 } for ch in channels]
-        
+
         try:
             return self._run_async(_query) or []
         except Exception as e:
             logger.error(f"获取通知渠道失败: {e}")
             return []
-    
+
     def get_all_message_notifications(self) -> Dict[str, List[Dict[str, Any]]]:
         """获取所有账号的通知配置
-        
+
         Returns:
             按cookie_id分组的通知配置字典
         """
         from common.models.notification_channel import NotificationChannel
         from common.models.message_notification import MessageNotification
-        
+
         async def _query(session_maker):
             async with session_maker() as session:
                 stmt = select(
@@ -1164,16 +1181,16 @@ class DBManagerCompat:
                     MessageNotification.account_identifier,
                     MessageNotification.id
                 )
-                
+
                 result = await session.execute(stmt)
                 rows = result.all()
-                
+
                 notifications_dict = {}
                 for notification, channel in rows:
                     cookie_id = notification.account_identifier
                     if cookie_id not in notifications_dict:
                         notifications_dict[cookie_id] = []
-                    
+
                     notifications_dict[cookie_id].append({
                         'id': notification.id,
                         'channel_id': channel.id,
@@ -1182,23 +1199,23 @@ class DBManagerCompat:
                         'channel_type': channel.channel_type,
                         'channel_config': channel.config_payload
                     })
-                
+
                 return notifications_dict
-        
+
         try:
             return self._run_async(_query) or {}
         except Exception as e:
             logger.error(f"获取所有消息通知配置失败: {e}")
             return {}
-    
+
     def save_item_info(self, cookie_id: str, item_id: str, item_data=None, **kwargs) -> bool:
         """保存或更新商品信息
-        
+
         Args:
             cookie_id: Cookie ID
             item_id: 商品ID
             item_data: 商品详情数据，可以是字符串或字典
-            
+
         Returns:
             bool: 操作是否成功
         """
@@ -1206,7 +1223,7 @@ class DBManagerCompat:
         if not item_data:
             logger.debug(f"跳过保存商品信息：缺少商品详情数据 - {item_id}")
             return False
-        
+
         async def _save(session_maker):
             async with session_maker() as session:
                 # 获取账号主键
@@ -1216,9 +1233,9 @@ class DBManagerCompat:
                 if not account_row:
                     logger.warning(f"保存商品信息失败：账号不存在 - {cookie_id}")
                     return False
-                
+
                 account_pk, owner_id = account_row
-                
+
                 # 检查商品是否已存在
                 stmt = select(XYCatalogItem).where(
                     XYCatalogItem.account_pk == account_pk,
@@ -1226,7 +1243,7 @@ class DBManagerCompat:
                 )
                 result = await session.execute(stmt)
                 existing = result.scalars().first()
-                
+
                 if existing:
                     # 更新商品信息
                     metadata = existing.metadata_json or {}
@@ -1250,7 +1267,7 @@ class DBManagerCompat:
                         detail_str = json.dumps(item_data, ensure_ascii=False)
                     else:
                         detail_str = item_data
-                    
+
                     new_item = XYCatalogItem(
                         owner_id=owner_id,
                         account_pk=account_pk,
@@ -1261,21 +1278,21 @@ class DBManagerCompat:
                     session.add(new_item)
                     await session.commit()
                     logger.info(f"新增商品信息: {item_id}")
-                
+
                 return True
-        
+
         try:
             return self._run_async(_save) or False
         except Exception as e:
             logger.error(f"保存商品信息失败: {e}")
             return False
-    
+
     def batch_save_item_basic_info(self, items: List[Dict[str, Any]]) -> int:
         """批量保存商品基本信息（新商品）
-        
+
         Args:
             items: 商品信息列表，每个包含 cookie_id, item_id, item_title, item_price, item_category, item_detail 等
-            
+
         Returns:
             int: 成功保存的数量
         """
@@ -1286,10 +1303,10 @@ class DBManagerCompat:
                     try:
                         cookie_id = item_data.get('cookie_id')
                         item_id = item_data.get('item_id')
-                        
+
                         if not cookie_id or not item_id:
                             continue
-                        
+
                         # 获取账号主键和owner_id
                         account_stmt = select(XYAccount.id, XYAccount.owner_id).where(XYAccount.account_id == cookie_id)
                         account_result = await session.execute(account_stmt)
@@ -1297,7 +1314,7 @@ class DBManagerCompat:
                         if not account_row:
                             logger.warning(f"批量保存商品: 未找到账号 {cookie_id}")
                             continue
-                        
+
                         # 检查商品是否已存在
                         existing_stmt = select(XYCatalogItem.id).where(
                             XYCatalogItem.account_pk == account_row.id,
@@ -1306,7 +1323,7 @@ class DBManagerCompat:
                         existing_result = await session.execute(existing_stmt)
                         if existing_result.scalar_one_or_none():
                             continue  # 已存在，跳过
-                        
+
                         # 创建新商品
                         new_item = XYCatalogItem(
                             owner_id=account_row.owner_id,
@@ -1326,22 +1343,22 @@ class DBManagerCompat:
                     except Exception as e:
                         logger.error(f"保存商品 {item_data.get('item_id')} 失败: {e}")
                         continue
-                
+
                 await session.commit()
             return saved_count
-        
+
         try:
             return self._run_async(_batch_save) or 0
         except Exception as e:
             logger.error(f"批量保存商品基本信息失败: {e}")
             return 0
-    
+
     def batch_update_item_title_price(self, items: List[Dict[str, Any]]) -> int:
         """批量更新商品标题和价格
-        
+
         Args:
             items: 商品信息列表，每个包含 cookie_id, item_id, item_title, item_price 等
-            
+
         Returns:
             int: 成功更新的数量
         """
@@ -1352,24 +1369,24 @@ class DBManagerCompat:
                     try:
                         cookie_id = item_data.get('cookie_id')
                         item_id = item_data.get('item_id')
-                        
+
                         if not cookie_id or not item_id:
                             continue
-                        
+
                         # 获取账号主键
                         account_stmt = select(XYAccount.id).where(XYAccount.account_id == cookie_id)
                         account_result = await session.execute(account_stmt)
                         account_pk = account_result.scalar_one_or_none()
                         if not account_pk:
                             continue
-                        
+
                         # 更新商品标题和价格
                         update_values = {}
                         if 'item_title' in item_data:
                             update_values['title'] = item_data['item_title']
                         if 'item_price' in item_data:
                             update_values['price'] = item_data['item_price']
-                        
+
                         if update_values:
                             stmt = update(XYCatalogItem).where(
                                 XYCatalogItem.account_pk == account_pk,
@@ -1381,10 +1398,10 @@ class DBManagerCompat:
                     except Exception as e:
                         logger.error(f"更新商品 {item_data.get('item_id')} 失败: {e}")
                         continue
-                
+
                 await session.commit()
             return updated_count
-        
+
         try:
             return self._run_async(_batch_update) or 0
         except Exception as e:
@@ -1393,12 +1410,12 @@ class DBManagerCompat:
 
     def update_item_detail(self, cookie_id: str, item_id: str, item_detail: str) -> bool:
         """更新商品详情（不覆盖商品标题等基本信息）
-        
+
         Args:
             cookie_id: Cookie ID
             item_id: 商品ID
             item_detail: 商品详情内容
-            
+
         Returns:
             bool: 操作是否成功
         """
@@ -1411,7 +1428,7 @@ class DBManagerCompat:
                 if not account_pk:
                     logger.warning(f"更新商品详情失败：账号不存在 - {cookie_id}")
                     return False
-                
+
                 # 查找商品
                 stmt = select(XYCatalogItem).where(
                     XYCatalogItem.account_pk == account_pk,
@@ -1419,25 +1436,25 @@ class DBManagerCompat:
                 )
                 result = await session.execute(stmt)
                 item = result.scalars().first()
-                
+
                 if not item:
                     logger.warning(f"更新商品详情失败：商品不存在 - {item_id}")
                     return False
-                
+
                 # 更新metadata_json中的detail字段
                 metadata = item.metadata_json or {}
                 metadata['detail'] = item_detail
-                
+
                 update_stmt = update(XYCatalogItem).where(
                     XYCatalogItem.account_pk == account_pk,
                     XYCatalogItem.item_id == item_id
                 ).values(metadata_json=metadata)
-                
+
                 await session.execute(update_stmt)
                 await session.commit()
                 logger.info(f"更新商品详情成功: {item_id}")
                 return True
-        
+
         try:
             return self._run_async(_update) or False
         except Exception as e:
@@ -1446,11 +1463,11 @@ class DBManagerCompat:
 
     def get_item_multi_spec_status(self, cookie_id: str, item_id: str) -> bool:
         """获取商品是否为多规格商品
-        
+
         Args:
             cookie_id: Cookie ID
             item_id: 商品ID
-            
+
         Returns:
             bool: 是否为多规格商品
         """
@@ -1459,29 +1476,29 @@ class DBManagerCompat:
             # 从metadata中获取multi_spec状态
             return info.get('multi_spec', False)
         return False
-    
+
     def get_cookie_by_id(self, cookie_id: str) -> Optional[Dict[str, Any]]:
         """根据cookie_id获取账号信息
-        
+
         Args:
             cookie_id: Cookie ID
-            
+
         Returns:
             账号信息字典或None
         """
         return self.get_cookie_details(cookie_id)
-    
-    def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None, 
+
+    def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                                cookie_id: str = None, chat_id: str = None, **kwargs) -> bool:
         """插入或更新订单
-        
+
         Args:
             order_id: 订单ID
             item_id: 商品ID
             buyer_id: 买家ID
             cookie_id: Cookie ID
             chat_id: 聊天会话ID
-            
+
         Returns:
             bool: 是否成功
         """
@@ -1491,7 +1508,7 @@ class DBManagerCompat:
                 stmt = select(XYOrder).where(XYOrder.order_no == order_id)
                 result = await session.execute(stmt)
                 existing = result.scalars().first()
-                
+
                 if existing:
                     # 更新：只有当数据库中的值为空时才更新
                     update_values = {}
@@ -1515,11 +1532,11 @@ class DBManagerCompat:
                         account = account_result.scalars().first()
                         if account:
                             owner_id = account.owner_id
-                    
+
                     if not owner_id:
                         logger.warning(f"无法获取owner_id，跳过订单插入: {order_id}")
                         return False
-                    
+
                     # 插入新订单
                     new_order = XYOrder(
                         order_no=order_id,
@@ -1540,15 +1557,15 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"插入或更新订单失败: {e}")
             return False
-    
+
     def get_cards_by_item_id(self, item_id: str, spec_name: str = None, spec_value: str = None) -> List[Dict[str, Any]]:
         """根据商品ID获取卡券列表（通过关联表查询，含向后兼容回退）
-        
+
         Args:
             item_id: 商品ID
             spec_name: 规格名称（可选，用于多规格匹配）
             spec_value: 规格值（可选，用于多规格匹配）
-            
+
         Returns:
             卡券列表
         """
@@ -1557,13 +1574,13 @@ class DBManagerCompat:
                 from common.services.card_matcher import CardMatcher
                 matcher = CardMatcher(session)
                 return await matcher.get_cards_by_item_id(item_id, spec_name, spec_value)
-        
+
         try:
             return self._run_async(_query) or []
         except Exception as e:
             logger.error(f"根据商品ID获取卡券失败: {e}")
             return []
-    
+
     def consume_batch_data(self, card_id: int) -> Optional[str]:
         """消费批量数据卡券的一条数据
 
@@ -1640,10 +1657,10 @@ class DBManagerCompat:
 
     def increment_delivery_count(self, card_id: int) -> bool:
         """增加卡券的发货次数
-        
+
         Args:
             card_id: 卡券ID
-            
+
         Returns:
             是否更新成功
         """
@@ -1657,7 +1674,7 @@ class DBManagerCompat:
                 result = await session.execute(stmt)
                 await session.commit()
                 return result.rowcount > 0
-        
+
         try:
             return self._run_async(_increment) or False
         except Exception as e:
@@ -1665,14 +1682,14 @@ class DBManagerCompat:
             return False
 
     # ==================== 消息过滤相关 ====================
-    
+
     def get_message_filter_keywords(self, cookie_id: str, filter_type: str = 'skip_reply') -> List[str]:
         """获取账号的消息过滤关键词列表
-        
+
         Args:
             cookie_id: 账号标识
             filter_type: 过滤类型，默认 'skip_reply'（跳过自动回复）
-            
+
         Returns:
             关键词列表
         """
@@ -1680,16 +1697,16 @@ class DBManagerCompat:
             async with session_maker() as session:
                 result = await session.execute(
                     text("""
-                        SELECT keyword FROM xy_message_filters 
-                        WHERE account_id = :account_id 
-                        AND filter_type = :filter_type 
+                        SELECT keyword FROM xy_message_filters
+                        WHERE account_id = :account_id
+                        AND filter_type = :filter_type
                         AND enabled = 1
                     """),
                     {"account_id": cookie_id, "filter_type": filter_type}
                 )
                 rows = result.fetchall()
                 return [row.keyword for row in rows]
-        
+
         try:
             return self._run_async(_query) or []
         except Exception as e:
